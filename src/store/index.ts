@@ -12,8 +12,8 @@
  */
 
 import { create } from 'zustand';
-import { createEngine } from '../core';
-import type { CalcEngine, EvalResult } from '../core';
+import { createEngine, tryCryptoCommand, tryPriceCommand, getSuggestions } from '../core';
+import type { CalcEngine, EvalResult, Suggestion } from '../core';
 import { parseInput, formatResult } from '../parser';
 
 export interface HistoryEntry {
@@ -24,6 +24,10 @@ export interface HistoryEntry {
   error: string | null;
   isAssignment: boolean;
   variableName?: string;
+  /** Multi-line display for crypto results (shown instead of single-line result) */
+  richDisplay?: string;
+  /** Label for crypto results (e.g., 'Profit', 'Gas Fee') */
+  resultLabel?: string;
   timestamp: number;
 }
 
@@ -32,6 +36,16 @@ interface CalcState {
   currentInput: string;
   liveResult: string;
   liveError: string | null;
+  /** Multi-line live display for crypto results */
+  liveRichDisplay: string | null;
+  /** Label for current crypto result */
+  liveResultLabel: string | null;
+  /** Whether an async price lookup is in progress */
+  isLoading: boolean;
+
+  // Suggestions
+  suggestions: Suggestion[];
+  selectedSuggestionIndex: number;
 
   // History
   history: HistoryEntry[];
@@ -48,6 +62,8 @@ interface CalcState {
   editHistoryEntry: (id: string, newInput: string) => void;
   deleteHistoryEntry: (id: string) => void;
   reuseResult: (id: string) => void;
+  applySuggestion: (suggestion: Suggestion) => void;
+  moveSuggestion: (direction: 'up' | 'down') => void;
   clearHistory: () => void;
   clearAll: () => void;
 }
@@ -64,6 +80,11 @@ export const useCalcStore = create<CalcState>((set, get) => {
     currentInput: '',
     liveResult: '',
     liveError: null,
+    liveRichDisplay: null,
+    liveResultLabel: null,
+    isLoading: false,
+    suggestions: [],
+    selectedSuggestionIndex: -1,
     history: [],
     variables: {},
     engine,
@@ -71,34 +92,139 @@ export const useCalcStore = create<CalcState>((set, get) => {
     /**
      * Update input and compute live result.
      * Called on every keystroke for instant feedback.
+     * 
+     * Evaluation priority:
+     * 1. Crypto commands (sync — sats, profit, gas, etc.)
+     * 2. Standard math expressions
+     * 3. Suggestions update in parallel
+     * 
+     * Price lookups are async and only triggered on Enter.
      */
     setInput: (input: string) => {
       const parsed = parseInput(input);
 
       if (parsed.type === 'empty') {
-        set({ currentInput: input, liveResult: '', liveError: null });
+        set({ currentInput: input, liveResult: '', liveError: null, liveRichDisplay: null, liveResultLabel: null, suggestions: [], selectedSuggestionIndex: -1 });
         return;
       }
 
+      // Compute suggestions
+      const suggestions = getSuggestions(input, 5);
+
+      // Try crypto command first (synchronous)
+      const cryptoResult = tryCryptoCommand(parsed.normalized);
+      if (cryptoResult) {
+        set({
+          currentInput: input,
+          liveResult: formatResult(cryptoResult.value),
+          liveRichDisplay: cryptoResult.display,
+          liveResultLabel: cryptoResult.label,
+          liveError: null,
+          suggestions,
+          selectedSuggestionIndex: -1,
+          variables: engine.getVariables(),
+        });
+        return;
+      }
+
+      // Standard math evaluation
       const result: EvalResult = engine.evaluate(parsed.normalized);
 
       set({
         currentInput: input,
         liveResult: result.error ? '' : formatResult(result.value),
+        liveRichDisplay: null,
+        liveResultLabel: null,
         liveError: result.error,
+        suggestions,
+        selectedSuggestionIndex: -1,
         variables: engine.getVariables(),
       });
     },
 
     /**
      * Commit current input to history (on Enter).
+     * 
+     * If the input matches a price command (async), we show a loading
+     * state and resolve the price before adding to history.
+     * Crypto commands and math are committed synchronously.
      */
     submitEntry: () => {
-      const { currentInput, engine } = get();
+      const { currentInput, engine, liveRichDisplay, liveResultLabel } = get();
       const parsed = parseInput(currentInput);
 
       if (parsed.type === 'empty') return;
 
+      // Check if this is a crypto command that was already evaluated live
+      const cryptoResult = tryCryptoCommand(parsed.normalized);
+      if (cryptoResult) {
+        const entry: HistoryEntry = {
+          id: generateId(),
+          input: currentInput,
+          result: formatResult(cryptoResult.value),
+          rawValue: cryptoResult.value,
+          error: null,
+          isAssignment: false,
+          richDisplay: cryptoResult.display,
+          resultLabel: cryptoResult.label,
+          timestamp: Date.now(),
+        };
+        set((state) => ({
+          history: [entry, ...state.history],
+          currentInput: '',
+          liveResult: '',
+          liveError: null,
+          liveRichDisplay: null,
+          liveResultLabel: null,
+          suggestions: [],
+        }));
+        return;
+      }
+
+      // Check if this is an async price lookup
+      const pricePromise = tryPriceCommand(parsed.normalized);
+      if (pricePromise) {
+        const inputSnapshot = currentInput;
+        set({ isLoading: true, currentInput: '', liveResult: '', liveError: null, liveRichDisplay: null, liveResultLabel: null, suggestions: [] });
+
+        pricePromise
+          .then((priceResult) => {
+            const entry: HistoryEntry = {
+              id: generateId(),
+              input: inputSnapshot,
+              result: formatResult(priceResult.value),
+              rawValue: priceResult.value,
+              error: null,
+              isAssignment: false,
+              richDisplay: priceResult.display,
+              resultLabel: priceResult.label,
+              timestamp: Date.now(),
+            };
+            set((state) => ({
+              history: [entry, ...state.history],
+              isLoading: false,
+            }));
+          })
+          .catch((err: unknown) => {
+            const msg = err instanceof Error ? err.message : 'Price lookup failed';
+            const entry: HistoryEntry = {
+              id: generateId(),
+              input: inputSnapshot,
+              result: '',
+              rawValue: null,
+              error: msg,
+              isAssignment: false,
+              timestamp: Date.now(),
+            };
+            set((state) => ({
+              history: [entry, ...state.history],
+              isLoading: false,
+            }));
+          });
+        return;
+      }
+
+      // Standard math evaluation
       const result = engine.evaluate(parsed.normalized);
 
       const entry: HistoryEntry = {
@@ -109,6 +235,8 @@ export const useCalcStore = create<CalcState>((set, get) => {
         error: result.error,
         isAssignment: result.isAssignment,
         variableName: result.variableName,
+        richDisplay: liveRichDisplay ?? undefined,
+        resultLabel: liveResultLabel ?? undefined,
         timestamp: Date.now(),
       };
 
@@ -117,6 +245,9 @@ export const useCalcStore = create<CalcState>((set, get) => {
         currentInput: '',
         liveResult: '',
         liveError: null,
+        liveRichDisplay: null,
+        liveResultLabel: null,
+        suggestions: [],
         variables: engine.getVariables(),
       }));
     },
@@ -172,6 +303,30 @@ export const useCalcStore = create<CalcState>((set, get) => {
       }
     },
 
+    /**
+     * Fill the input with a suggestion.
+     */
+    applySuggestion: (suggestion: Suggestion) => {
+      get().setInput(suggestion.text);
+    },
+
+    /**
+     * Navigate suggestions with arrow keys.
+     */
+    moveSuggestion: (direction: 'up' | 'down') => {
+      set((state) => {
+        const len = state.suggestions.length;
+        if (len === 0) return state;
+        let idx = state.selectedSuggestionIndex;
+        if (direction === 'down') {
+          idx = idx < len - 1 ? idx + 1 : 0;
+        } else {
+          idx = idx > 0 ? idx - 1 : len - 1;
+        }
+        return { selectedSuggestionIndex: idx };
+      });
+    },
+
     clearHistory: () => {
       set({ history: [] });
     },
@@ -183,6 +338,11 @@ export const useCalcStore = create<CalcState>((set, get) => {
         currentInput: '',
         liveResult: '',
         liveError: null,
+        liveRichDisplay: null,
+        liveResultLabel: null,
+        isLoading: false,
+        suggestions: [],
+        selectedSuggestionIndex: -1,
         variables: {},
       });
     },
